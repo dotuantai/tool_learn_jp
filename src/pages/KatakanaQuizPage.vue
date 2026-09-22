@@ -14,6 +14,7 @@ interface KataQuestion {
   mode: 'char-to-romaji' | 'romaji-to-char'
   options: string[]
   correct: string
+  isReview: boolean
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -57,13 +58,19 @@ function resolveMode(selected: QuizMode): 'char-to-romaji' | 'romaji-to-char' {
   return selected
 }
 
-function makeQuestion(item: KatakanaCharacter, selected: QuizMode, pool: KatakanaCharacter[]): KataQuestion {
+function makeQuestion(
+  item: KatakanaCharacter,
+  selected: QuizMode,
+  pool: KatakanaCharacter[],
+  isReview = false,
+): KataQuestion {
   const mode = resolveMode(selected)
   return {
     item,
     mode,
     options: buildOptions(item, mode, pool),
     correct: mode === 'char-to-romaji' ? item.romaji : item.character,
+    isReview,
   }
 }
 
@@ -82,7 +89,6 @@ const quizOrder   = ref<KataQuestion[]>([])
 const currentIdx  = ref(0)
 const answerState  = ref<AnswerState>('idle')
 const selected     = ref<string | null>(null)
-const wrongPicks   = ref<Set<string>>(new Set()) // đáp án sai đã chọn trong câu này
 const score        = ref({ correct: 0, incorrect: 0 })
 const isFinished   = ref(false)
 const cardKey      = ref(0)
@@ -106,12 +112,13 @@ const modeOptions: { value: QuizMode; label: string; icon: string }[] = [
 ]
 
 // ── Derived ──────────────────────────────────────────────────────────────────
-const total    = computed(() => quizOrder.value.length)
+const total    = computed(() => quizOrder.value.filter(item => !item.isReview).length)
 const question = computed(() => quizOrder.value[currentIdx.value] ?? null)
 const progress = computed(() => {
   if (isFinished.value) return total.value
-  return answerState.value === 'idle' ? currentIdx.value : currentIdx.value + 1
+  return score.value.correct + score.value.incorrect
 })
+const isLastQuestion = computed(() => currentIdx.value >= quizOrder.value.length - 1)
 const accuracy = computed(() => {
   const done = score.value.correct + score.value.incorrect
   return done === 0 ? 0 : Math.round((score.value.correct / done) * 100)
@@ -123,7 +130,6 @@ function startQuiz() {
   currentIdx.value  = 0
   answerState.value = 'idle'
   selected.value    = null
-  wrongPicks.value  = new Set()
   score.value       = { correct: 0, incorrect: 0 }
   isFinished.value  = false
   cardKey.value     = 0
@@ -152,39 +158,43 @@ function playAudio() {
   speakJapaneseWord(question.value.item.character, question.value.item.romaji)
 }
 
-function onSelect(option: string) {
-  if (!question.value) return
-  // Không cho chọn lại đáp án đã sai hoặc nếu đã đúng rồi
-  if (answerState.value === 'correct') return
-  if (wrongPicks.value.has(option)) return
+function scheduleReview(questionToReview: KataQuestion) {
+  const pool = getRangeData(wordRange.value)
+  const reviewQuestion = makeQuestion(questionToReview.item, questionToReview.mode, pool, true)
+  // Chèn sau 2 lượt khác nếu còn đủ câu; ở cuối hàng đợi thì chèn ngay sau câu hiện tại.
+  const reviewIndex = Math.min(currentIdx.value + 3, quizOrder.value.length)
+  quizOrder.value.splice(reviewIndex, 0, reviewQuestion)
+}
 
+function onSelect(option: string) {
+  if (answerState.value !== 'idle' || !question.value) return
+  const currentQuestion = question.value
   selected.value = option
 
-  if (option === question.value.correct) {
-    // Đúng rồi: tính điểm dựa trên lần đầu có sai không
-    if (wrongPicks.value.size === 0) {
-      score.value = { ...score.value, correct: score.value.correct + 1 }
-    } else {
-      score.value = { ...score.value, incorrect: score.value.incorrect + 1 }
-    }
+  if (option === currentQuestion.correct) {
     answerState.value = 'correct'
+    if (!currentQuestion.isReview) {
+      score.value = { ...score.value, correct: score.value.correct + 1 }
+    }
+    // Phát âm chuẩn khi trả lời đúng
     playAudio()
   } else {
-    // Sai: thêm vào danh sách sai, vẫn cho chọn lại
-    wrongPicks.value = new Set([...wrongPicks.value, option])
     answerState.value = 'incorrect'
+    if (!currentQuestion.isReview) {
+      score.value = { ...score.value, incorrect: score.value.incorrect + 1 }
+    }
+    scheduleReview(currentQuestion)
   }
 }
 
 function onNext() {
-  if (currentIdx.value >= total.value - 1) {
+  if (isLastQuestion.value) {
     isFinished.value = true
     return
   }
   currentIdx.value++
   answerState.value = 'idle'
   selected.value    = null
-  wrongPicks.value  = new Set()
   cardKey.value++
 }
 
@@ -192,16 +202,16 @@ function onNext() {
 function handleKeydown(e: KeyboardEvent) {
   if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return
 
-  // Phím 1–4: chọn đáp án (chỉ khi chưa đúng và option đó chưa bị sai)
-  if (['1', '2', '3', '4'].includes(e.key) && answerState.value !== 'correct' && question.value) {
+  // Phím 1–4: chọn đáp án
+  if (['1', '2', '3', '4'].includes(e.key) && answerState.value === 'idle' && question.value) {
     const idx = parseInt(e.key) - 1
     const opt = question.value.options[idx]
-    if (opt !== undefined && !wrongPicks.value.has(opt)) onSelect(opt)
+    if (opt !== undefined) onSelect(opt)
     return
   }
 
-  // Enter hoặc Space: qua câu tiếp theo (chỉ khi đã đúng)
-  if ((e.key === 'Enter' || e.key === ' ') && answerState.value === 'correct') {
+  // Enter hoặc Space: qua câu tiếp theo
+  if ((e.key === 'Enter' || e.key === ' ') && answerState.value !== 'idle') {
     e.preventDefault()
     onNext()
   }
@@ -391,12 +401,12 @@ startQuiz()
             type="button"
             class="choice-btn ios-pressable"
             :class="{
-              'choice-correct':  opt === question.correct && answerState === 'correct',
-              'choice-wrong':    wrongPicks.has(opt),
-              'choice-dimmed':   answerState === 'correct' && opt !== question.correct && !wrongPicks.has(opt),
+              'choice-correct':  answerState !== 'idle' && opt === question.correct,
+              'choice-wrong':    answerState !== 'idle' && opt === selected && opt !== question.correct,
+              'choice-dimmed':   answerState !== 'idle' && opt !== selected && opt !== question.correct,
               'choice-kana':     question.mode === 'romaji-to-char',
             }"
-            :disabled="wrongPicks.has(opt) || answerState === 'correct'"
+            :disabled="answerState !== 'idle'"
             @click="onSelect(opt)"
           >
             <span class="choice-key-badge">{{ idx + 1 }}</span>
@@ -406,36 +416,24 @@ startQuiz()
 
         <!-- Bottom Feedback Floating Bar -->
         <Transition name="feedback">
-          <div
-            v-if="answerState !== 'idle'"
-            class="feedback-panel"
-            :class="{ 'feedback-panel-wrong': answerState === 'incorrect' }"
-          >
-            <!-- Sai: gợi ý chọn lại -->
-            <div v-if="answerState === 'incorrect'" class="feedback-status">
-              <span class="status-icon-wrong">✕</span>
+          <div v-if="answerState !== 'idle'" class="feedback-panel">
+            <div class="feedback-status">
+              <span v-if="answerState === 'correct'" class="status-icon-correct">✓</span>
+              <span v-else class="status-icon-wrong">✕</span>
               <div class="status-text">
-                <p class="status-title wrong-title">Sai rồi! Hãy chọn lại 👇</p>
+                <p v-if="answerState === 'correct'" class="status-title correct-title">Chính xác!</p>
+                <p v-else class="status-title wrong-title">
+                  Đáp án đúng: <span class="highlight-ans">{{ question.correct }}</span>
+                </p>
               </div>
             </div>
 
-            <!-- Đúng: hiện chính xác + nút Tiếp theo -->
-            <template v-else-if="answerState === 'correct'">
-              <div class="feedback-status">
-                <span class="status-icon-correct">✓</span>
-                <div class="status-text">
-                  <p class="status-title correct-title">Chính xác!</p>
-                  <p v-if="wrongPicks.size > 0" class="status-subtitle">Bạn đã thử {{ wrongPicks.size }} lần sai</p>
-                </div>
-              </div>
-
-              <button type="button" class="primary-btn next-action ios-pressable" @click="onNext">
-                <span>{{ currentIdx >= total - 1 ? 'Xem kết quả' : 'Tiếp theo' }}</span>
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-4 h-4">
-                  <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5 21 12m0 0-7.5 7.5M21 12H3" />
-                </svg>
-              </button>
-            </template>
+            <button type="button" class="primary-btn next-action ios-pressable" @click="onNext">
+              <span>{{ isLastQuestion ? 'Xem kết quả' : 'Tiếp theo' }}</span>
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" class="w-4 h-4">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5 21 12m0 0-7.5 7.5M21 12H3" />
+              </svg>
+            </button>
           </div>
         </Transition>
       </div>
@@ -969,11 +967,7 @@ startQuiz()
   line-height: 1.2;
 }
 
-/* Compact panel khi sai - không có nút Next, nhỏ hơn */
-.feedback-panel-wrong {
-  padding: 0.9rem 1.25rem calc(var(--sab, env(safe-area-inset-bottom)) + 0.9rem);
-  gap: 0;
-}
+/* highlight-ans dùng màu teal của Katakana */
 
 .highlight-ans {
   font-family: 'M PLUS Rounded 1c', sans-serif;
